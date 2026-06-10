@@ -1,0 +1,11 @@
+# Copy this file to ".env" and fill in your real key. Never commit .env.
+
+# Your Google Maps Platform API key (see SETUP.md for how to create one).
+GOOGLE_MAPS_API_KEY=your_key_here
+
+# Port the server listens on.
+PORT=8787
+
+# Lock this to your app's domain in production, e.g. https://forkit.app
+# "*" is fine for local development only.
+ALLOWED_ORIGIN=*

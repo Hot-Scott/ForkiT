@@ -1,0 +1,51 @@
+# ForkIt — App (Frontend)
+
+The runnable React app. Works out of the box in **demo mode** (sample
+restaurants), and switches to **live mode** automatically when you point it at
+your deployed backends.
+
+## Run it locally
+
+```bash
+cd app
+npm install
+npm run dev
+```
+
+Open the URL it prints (usually http://localhost:5173). You can invite family
+members, swipe, and see a match with sample restaurants — no backend needed.
+
+## Go live (use real restaurants)
+
+1. Deploy the backends (see `../forkit-backend/DEPLOY.md`).
+2. Copy `.env.example` to `.env.production` and fill in your URLs:
+   ```
+   VITE_API_BASE=https://forkit-api.onrender.com
+   VITE_MP_BASE=wss://forkit-mp.onrender.com
+   ```
+3. Deploy this `app/` folder to Vercel (also in DEPLOY.md). Add the same two
+   variables in Vercel's project settings.
+
+## Files
+
+- `index.html` — page shell, mounts the app
+- `src/main.jsx` — React entry point
+- `src/App.jsx` — the whole app (household, swiping, results)
+- `src/forkitApi.js` — calls your Google proxy for restaurants
+- `src/forkitMultiplayer.js` — client for the realtime voting server
+- `src/index.css` — base styles
+- `vite.config.js` — build config
+
+## Build for production
+
+```bash
+npm run build      # outputs to dist/
+npm run preview    # preview the production build
+```
+
+## Note on multiplayer
+
+`App.jsx` is the single-device flow. The realtime multiplayer client is in
+`src/forkitMultiplayer.js`, ready to wire into a "join a household" screen once
+both backends are deployed. The standalone demo of that flow is
+`../forkit-multiplayer-demo.jsx`.

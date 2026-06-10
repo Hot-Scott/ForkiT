@@ -1,0 +1,49 @@
+// ============================================================================
+// ForkIt — API client
+// Drop this into the app. It talks to YOUR backend (server.js), never to Google
+// directly, so your API key is never shipped to the browser.
+// ============================================================================
+
+const API_BASE = import.meta?.env?.VITE_API_BASE || "http://localhost:8787";
+
+// Ask the browser for the household's current location (one-time prompt).
+export function getCurrentLocation() {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) return reject(new Error("Geolocation unsupported"));
+    navigator.geolocation.getCurrentPosition(
+      (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+      (err) => reject(err),
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+  });
+}
+
+// Fall back to a typed address / zip when GPS is denied.
+export async function geocode(address) {
+  const r = await fetch(`${API_BASE}/api/geocode?address=${encodeURIComponent(address)}`);
+  if (!r.ok) throw new Error("Could not find that location");
+  return r.json(); // { lat, lng, formatted }
+}
+
+// The core call: cuisine + coordinates -> ranked nearby restaurants.
+export async function findRestaurants({ cuisine, lat, lng, radiusMeters, openNow }) {
+  const r = await fetch(`${API_BASE}/api/restaurants`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cuisine, lat, lng, radiusMeters, openNow }),
+  });
+  if (!r.ok) throw new Error("Restaurant search failed");
+  return r.json(); // { cuisine, count, restaurants: [...] }
+}
+
+// Full detail for the restaurant card (hours, phone, website, reviews).
+export async function placeDetails(id) {
+  const r = await fetch(`${API_BASE}/api/place/${encodeURIComponent(id)}`);
+  if (!r.ok) throw new Error("Could not load place");
+  return r.json();
+}
+
+// Turn a photoName from search results into a usable <img src>.
+export function photoUrl(photoName, width = 640) {
+  return `${API_BASE}/api/photo?name=${encodeURIComponent(photoName)}&w=${width}`;
+}

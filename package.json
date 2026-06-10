@@ -1,0 +1,262 @@
+// ============================================================================
+// ForkIt — Realtime Multiplayer Server
+// ----------------------------------------------------------------------------
+// Handles the "household" half of the app: the head creates a round, family
+// members join by code from their own phones, everyone swipes, and the server
+// detects a MAJORITY match in real time and pushes the result to all phones.
+//
+// Storage is IN-MEMORY (a Map) — the simplest thing that runs with zero setup.
+// Everything lives in `rooms`. To make it production-durable, swap the `rooms`
+// Map for Redis or a database (see PERSISTENCE NOTE at the bottom). The message
+// shapes won't change.
+//
+// Transport is WebSockets via the `ws` library so every phone sees votes live.
+//
+// Run:  npm install  &&  npm start   (listens on PORT, default 8788)
+// ============================================================================
+
+import { WebSocketServer } from "ws";
+import { createServer } from "http";
+import { randomUUID } from "crypto";
+
+const PORT = process.env.MP_PORT || 8788;
+
+// The eight cuisines must match the app deck.
+const CUISINES = [
+  "american", "mexican", "indian", "italian",
+  "japanese", "thai", "chinese", "mediterranean",
+];
+
+// ── In-memory store ──────────────────────────────────────────────────────────
+// rooms: code -> {
+//   code, headId, status: "lobby"|"swiping"|"matched",
+//   members: Map<memberId, { id, name, emoji, isHead, connected, done }>,
+//   votes:   Map<memberId, Set<cuisine>>,   // each member's "yes" swipes
+//   winner:  string|null,
+//   sockets: Map<memberId, ws>,             // live connections
+// }
+const rooms = new Map();
+
+function makeCode() {
+  // 4-char human-friendly room code, e.g. "K7QM". Avoids ambiguous chars.
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code;
+  do {
+    code = Array.from({ length: 4 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join("");
+  } while (rooms.has(code));
+  return code;
+}
+
+// ── Majority-vote matching ─────────────────────────────────────────────────────
+// A cuisine "wins" when MORE THAN HALF of the household has swiped right on it.
+// We compute the winner the moment that threshold is crossed. If several reach
+// majority, the one with the most yes-votes wins (ties -> first by deck order).
+function evaluateMatch(room) {
+  const memberCount = room.members.size;
+  if (memberCount === 0) return null;
+  const needed = Math.floor(memberCount / 2) + 1; // strict majority
+
+  const tally = Object.fromEntries(CUISINES.map((c) => [c, 0]));
+  for (const yesSet of room.votes.values()) {
+    for (const c of yesSet) if (tally[c] != null) tally[c] += 1;
+  }
+
+  let best = null;
+  for (const c of CUISINES) {
+    if (tally[c] >= needed && (!best || tally[c] > tally[best])) best = c;
+  }
+  return best ? { winner: best, votes: tally[best], needed, tally } : null;
+}
+
+function publicRoom(room) {
+  return {
+    code: room.code,
+    status: room.status,
+    headId: room.headId,
+    winner: room.winner,
+    members: [...room.members.values()].map((m) => ({
+      id: m.id, name: m.name, emoji: m.emoji,
+      isHead: m.isHead, connected: m.connected, done: m.done,
+    })),
+  };
+}
+
+// Send a JSON message to one socket.
+function send(ws, type, payload) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type, ...payload }));
+}
+
+// Broadcast room state (and optional extra) to everyone in the room.
+function broadcast(room, type, extra = {}) {
+  const msg = JSON.stringify({ type, room: publicRoom(room), ...extra });
+  for (const ws of room.sockets.values()) if (ws.readyState === 1) ws.send(msg);
+}
+
+// ── WebSocket server ───────────────────────────────────────────────────────────
+const server = createServer((req, res) => {
+  if (req.url === "/health") { res.writeHead(200); res.end("ok"); return; }
+  res.writeHead(404); res.end();
+});
+const wss = new WebSocketServer({ server });
+
+wss.on("connection", (ws) => {
+  // Track what this socket is bound to so we can clean up on disconnect.
+  let boundCode = null;
+  let boundMemberId = null;
+
+  ws.on("message", (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
+    switch (msg.type) {
+
+      // Head creates a household round. -> returns code + memberId.
+      case "create": {
+        const code = makeCode();
+        const memberId = randomUUID();
+        const room = {
+          code, headId: memberId, status: "lobby",
+          members: new Map(), votes: new Map(),
+          winner: null, sockets: new Map(),
+        };
+        room.members.set(memberId, {
+          id: memberId, name: msg.name || "Head",
+          emoji: msg.emoji || "👑", isHead: true, connected: true, done: false,
+        });
+        room.votes.set(memberId, new Set());
+        room.sockets.set(memberId, ws);
+        rooms.set(code, room);
+        boundCode = code; boundMemberId = memberId;
+        send(ws, "created", { code, memberId, room: publicRoom(room) });
+        break;
+      }
+
+      // A family member joins with the code the head shared.
+      case "join": {
+        const room = rooms.get((msg.code || "").toUpperCase());
+        if (!room) return send(ws, "error", { message: "Room not found" });
+        if (room.status === "matched") return send(ws, "error", { message: "Round already finished" });
+        const memberId = randomUUID();
+        room.members.set(memberId, {
+          id: memberId, name: msg.name || "Guest",
+          emoji: msg.emoji || "🧑", isHead: false, connected: true, done: false,
+        });
+        room.votes.set(memberId, new Set());
+        room.sockets.set(memberId, ws);
+        boundCode = room.code; boundMemberId = memberId;
+        send(ws, "joined", { code: room.code, memberId, room: publicRoom(room) });
+        broadcast(room, "room_update");
+        break;
+      }
+
+      // Reconnect an existing member (e.g. phone refreshed) by id.
+      case "resume": {
+        const room = rooms.get((msg.code || "").toUpperCase());
+        if (!room || !room.members.has(msg.memberId))
+          return send(ws, "error", { message: "Cannot resume" });
+        const m = room.members.get(msg.memberId);
+        m.connected = true;
+        room.sockets.set(msg.memberId, ws);
+        boundCode = room.code; boundMemberId = msg.memberId;
+        send(ws, "resumed", { code: room.code, memberId: msg.memberId, room: publicRoom(room) });
+        broadcast(room, "room_update");
+        break;
+      }
+
+      // Head starts the swiping phase for everyone.
+      case "start": {
+        const room = rooms.get(boundCode);
+        if (!room || boundMemberId !== room.headId) return;
+        room.status = "swiping";
+        broadcast(room, "round_started");
+        break;
+      }
+
+      // A swipe. We only record "yes" (right) swipes; "no" carries no weight.
+      case "swipe": {
+        const room = rooms.get(boundCode);
+        if (!room || room.status !== "swiping") return;
+        const set = room.votes.get(boundMemberId);
+        if (!set) return;
+        if (msg.like && CUISINES.includes(msg.cuisine)) set.add(msg.cuisine);
+
+        // Re-check for a majority match after every swipe.
+        const result = evaluateMatch(room);
+        if (result) {
+          room.status = "matched";
+          room.winner = result.winner;
+          broadcast(room, "matched", { result });
+        } else {
+          // Push live tallies so phones can show "Mexican: 2 yes" etc.
+          broadcast(room, "tally", { tally: tallyOf(room) });
+        }
+        break;
+      }
+
+      // Member finished their whole deck without triggering a match yet.
+      case "done": {
+        const room = rooms.get(boundCode);
+        if (!room) return;
+        const m = room.members.get(boundMemberId);
+        if (m) m.done = true;
+
+        // If everyone is done and still no majority, fall back to the most-liked.
+        const allDone = [...room.members.values()].every((x) => x.done);
+        if (allDone && room.status === "swiping") {
+          const t = tallyOf(room);
+          const top = Object.entries(t).sort((a, b) => b[1] - a[1])[0];
+          room.status = "matched";
+          room.winner = top && top[1] > 0 ? top[0] : null;
+          broadcast(room, "matched", {
+            result: { winner: room.winner, votes: top?.[1] || 0, fallback: true, tally: t },
+          });
+        } else {
+          broadcast(room, "room_update");
+        }
+        break;
+      }
+
+      case "reset": {
+        const room = rooms.get(boundCode);
+        if (!room || boundMemberId !== room.headId) return;
+        room.status = "lobby"; room.winner = null;
+        for (const id of room.votes.keys()) room.votes.set(id, new Set());
+        for (const m of room.members.values()) m.done = false;
+        broadcast(room, "room_update");
+        break;
+      }
+    }
+  });
+
+  ws.on("close", () => {
+    const room = rooms.get(boundCode);
+    if (!room) return;
+    const m = room.members.get(boundMemberId);
+    if (m) m.connected = false;
+    room.sockets.delete(boundMemberId);
+    broadcast(room, "room_update");
+    // Clean up empty rooms so memory doesn't grow forever.
+    if ([...room.members.values()].every((x) => !x.connected)) {
+      setTimeout(() => {
+        const r = rooms.get(boundCode);
+        if (r && [...r.members.values()].every((x) => !x.connected)) rooms.delete(boundCode);
+      }, 1000 * 60 * 30); // drop abandoned rooms after 30 min
+    }
+  });
+});
+
+function tallyOf(room) {
+  const t = Object.fromEntries(CUISINES.map((c) => [c, 0]));
+  for (const set of room.votes.values()) for (const c of set) if (t[c] != null) t[c]++;
+  return t;
+}
+
+server.listen(PORT, () => console.log(`🔌 ForkIt multiplayer server on ws://localhost:${PORT}`));
+
+// ── PERSISTENCE NOTE ───────────────────────────────────────────────────────────
+// Everything is in the `rooms` Map, so a server restart wipes active rounds —
+// fine for launch/demo. To survive restarts and scale past one server:
+//   1. Move room state to Redis (one hash per room code).
+//   2. Use Redis pub/sub so multiple server instances broadcast to all sockets.
+//   3. Persist finished rounds to a DB if you want history/analytics.
+// The client protocol below stays identical either way.
